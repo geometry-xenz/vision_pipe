@@ -8,6 +8,12 @@ VERSION = "vision_pipe 1.0"
 EXT_IMAGES = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif'}
 EXT_VIDEOS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv'}
 
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'models', 'yolov8n.onnx'
+)
+
+_quiet = False
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -42,10 +48,32 @@ def ext_type(path):
     return None
 
 
+def ensure_model() -> str:
+    if os.path.exists(MODEL_PATH):
+        return os.path.abspath(MODEL_PATH)
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        sys.stderr.write('Model not found and ultralytics not installed. Run: pip install ultralytics onnx\n')
+        sys.exit(1)
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    if not _quiet:
+        sys.stderr.write('exporting model...\n')
+    YOLO('yolov8n.pt').export(format='onnx')
+    if not os.path.exists(MODEL_PATH):
+        produced = os.path.join(os.getcwd(), 'yolov8n.onnx')
+        if os.path.exists(produced):
+            os.replace(produced, MODEL_PATH)
+    return os.path.abspath(MODEL_PATH)
+
+
 def main() -> int:
     parser = build_parser()
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
+
+    global _quiet
+    _quiet = args.quiet
 
     if not args.input and not args.input_flag:
         sys.stderr.write("input required\n")
@@ -68,6 +96,8 @@ def main() -> int:
             f"Supported videos: {sorted(EXT_VIDEOS)}\n"
         )
         return 2
+
+    model_path = ensure_model()
 
     sys.stderr.write(f"{kind}\n")
     sys.stderr.write("not yet implemented\n")
