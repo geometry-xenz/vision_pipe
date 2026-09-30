@@ -2,6 +2,7 @@
 import argparse
 import os.path
 import sys
+import threading
 
 VERSION = "vision_pipe 1.0"
 
@@ -67,6 +68,94 @@ def ensure_model() -> str:
     return os.path.abspath(MODEL_PATH)
 
 
+def detect_duration(path) -> float:
+    import subprocess
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', path],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            return float(r.stdout.strip())
+        except ValueError:
+            pass
+    import cv2
+    cap = cv2.VideoCapture(path)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if fps > 0 and n > 0:
+            return float(n) / float(fps)
+    finally:
+        cap.release()
+    return 0.0
+
+
+def extract_frames(path, fps):
+    import subprocess
+    from subprocess import PIPE
+    import cv2
+    import numpy as np
+
+    proc = subprocess.Popen(
+        ['ffmpeg', '-loglevel', 'error', '-i', path, '-vf', f'fps={fps}',
+         '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'],
+        stdout=PIPE, stderr=PIPE, bufsize=10 ** 8,
+    )
+    err_chunks = []
+
+    def _drain_err():
+        try:
+            while True:
+                c = proc.stderr.read(4096)
+                if not c:
+                    break
+                err_chunks.append(c)
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_drain_err, daemon=True)
+    t.start()
+
+    try:
+        buf = bytearray()
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while True:
+                start = buf.find(b'\xff\xd8')
+                if start == -1:
+                    break
+                end = buf.find(b'\xff\xd9', start + 2)
+                if end == -1:
+                    break
+                jpeg = bytes(buf[:end + 2])
+                del buf[:end + 2]
+                arr = np.frombuffer(jpeg, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    yield frame
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+        t.join(timeout=1.0)
+        if proc.returncode != 0:
+            err = b''.join(err_chunks).decode('utf-8', errors='replace').strip()
+            if err:
+                sys.stderr.write(err + '\n')
+            sys.exit(1)
+
+
 def main() -> int:
     parser = build_parser()
     parser.add_argument("--version", action="version", version=VERSION)
@@ -99,7 +188,30 @@ def main() -> int:
 
     model_path = ensure_model()
 
-    sys.stderr.write(f"{kind}\n")
+    if kind == 'image':
+        import cv2
+        img = cv2.imread(path)
+        if img is None:
+            sys.stderr.write(f"could not read image: {path}\n")
+            return 2
+        h, w = img.shape[:2]
+        sys.stderr.write(f"image: {w}x{h}\n")
+        sys.stderr.write("not yet implemented\n")
+        return 1
+
+    if kind == 'video':
+        duration = detect_duration(path)
+        sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
+        n = 0
+        for _ in extract_frames(path, args.fps):
+            n += 1
+            if not _quiet and n % 10 == 0:
+                sys.stderr.write(f"processed {n} frames\n")
+        if not _quiet:
+            sys.stderr.write(f"processed {n} frames\n")
+        sys.stderr.write("not yet implemented\n")
+        return 1
+
     sys.stderr.write("not yet implemented\n")
     return 1
 
