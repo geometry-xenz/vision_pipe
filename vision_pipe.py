@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os.path
 import sys
 import threading
@@ -262,6 +263,93 @@ def load_session(model_path):
     return ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
 
 
+def _round_det(d):
+    return {
+        'class': d['class'],
+        'confidence': round(d['confidence'], 2),
+        'bbox': [int(round(v)) for v in d['bbox']],
+    }
+
+
+def aggregate(timeline, fps):
+    counts = {}
+    first_idx = {}
+    last_idx = {}
+    for entry in timeline:
+        idx = entry['frame']
+        for obj in entry['objects']:
+            cls = obj['class']
+            counts[cls] = counts.get(cls, 0) + 1
+            if cls not in first_idx:
+                first_idx[cls] = idx
+            last_idx[cls] = idx
+    classes_detected = sorted(counts.keys())
+    inv = 1.0 / fps if fps else 0.0
+    summary = {
+        cls: {
+            'count': counts[cls],
+            'first_seen': first_idx[cls] * inv,
+            'last_seen': last_idx[cls] * inv,
+        }
+        for cls in classes_detected
+    }
+    return classes_detected, summary
+
+
+def format_image(d):
+    return json.dumps(d, indent=2)
+
+
+def format_video(d):
+    return json.dumps(d, indent=2)
+
+
+def _format_text_image(d):
+    counts = {}
+    for obj in d['objects']:
+        counts[obj['class']] = counts.get(obj['class'], 0) + 1
+    lines = [f"Image analysis ({d['width']}x{d['height']}):"]
+    for cls in sorted(counts):
+        lines.append(f"  - {cls}: {counts[cls]} detections")
+    return "\n".join(lines)
+
+
+def _format_text_video(d):
+    n = d['total_frames']
+    fps = d['fps']
+    dur = d['duration_sec']
+    lines = [
+        f"Video analysis ({n} frames at {fps} fps, {dur}s total):",
+        "",
+        "Detections by class:",
+    ]
+    for cls in d['classes_detected']:
+        s = d['summary'][cls]
+        lines.append(
+            f"  - {cls}: {s['count']} total, "
+            f"first seen at {s['first_seen']}s, last seen at {s['last_seen']}s"
+        )
+    lines.append("")
+    lines.append("Notable frames (2+ objects):")
+    notable = [e for e in d['timeline'] if len(e['objects']) >= 2]
+    cap = 10
+    truncated = len(notable) > cap
+    if truncated:
+        notable = notable[:cap]
+    for e in notable:
+        classes = ", ".join(o['class'] for o in e['objects'])
+        lines.append(f"  @ {e['timestamp']}s: {classes}")
+    if truncated:
+        lines.append("  ...")
+    return "\n".join(lines)
+
+
+def format_text(d):
+    if d['type'] == 'image':
+        return _format_text_image(d)
+    return _format_text_video(d)
+
+
 def main() -> int:
     parser = build_parser()
     parser.add_argument("--version", action="version", version=VERSION)
@@ -304,29 +392,69 @@ def main() -> int:
         h, w = img.shape[:2]
         sys.stderr.write(f"image: {w}x{h}\n")
         dets = nms(infer(session, img, args.conf, args.classes))
-        for d in dets:
+        norm = [_round_det(d) for d in dets]
+        for d in norm:
             x1, y1, x2, y2 = d['bbox']
             sys.stderr.write(
                 f"class {d['class']} conf={d['confidence']:.2f} "
                 f"bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]\n"
             )
-        sys.stderr.write(f"image: {len(dets)} detections\n")
+        sys.stderr.write(f"image: {len(norm)} detections\n")
+        payload = {
+            'tool': 'vision_pipe',
+            'version': '1.0',
+            'input': path,
+            'type': 'image',
+            'width': w,
+            'height': h,
+            'model': 'yolov8n',
+            'objects': norm,
+        }
+        print(format_text(payload) if args.text_only else format_image(payload))
         return 0
 
     if kind == 'video':
         duration = detect_duration(path)
         sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
+        timeline = []
+        width = height = 0
         n_frames = 0
         total_dets = 0
+        inv_fps = 1.0 / args.fps if args.fps else 0.0
         for frame in extract_frames(path, args.fps):
-            n_frames += 1
+            if n_frames == 0:
+                height, width = frame.shape[:2]
             dets = nms(infer(session, frame, args.conf, args.classes))
-            total_dets += len(dets)
+            norm = [_round_det(d) for d in dets]
+            timeline.append({
+                'frame': n_frames,
+                'timestamp': n_frames * inv_fps,
+                'objects': norm,
+            })
+            n_frames += 1
+            total_dets += len(norm)
             if not _quiet and n_frames % 10 == 0:
                 sys.stderr.write(f"processed {n_frames} frames\n")
         if not _quiet:
             sys.stderr.write(f"processed {n_frames} frames\n")
         sys.stderr.write(f"video: {total_dets} detections across {n_frames} frames\n")
+        classes_detected, summary = aggregate(timeline, args.fps)
+        payload = {
+            'tool': 'vision_pipe',
+            'version': '1.0',
+            'input': path,
+            'type': 'video',
+            'fps': args.fps,
+            'duration_sec': duration,
+            'total_frames': n_frames,
+            'width': width,
+            'height': height,
+            'model': 'yolov8n',
+            'classes_detected': classes_detected,
+            'timeline': timeline,
+            'summary': summary,
+        }
+        print(format_text(payload) if args.text_only else format_video(payload))
         return 0
 
     sys.stderr.write("not yet implemented\n")
