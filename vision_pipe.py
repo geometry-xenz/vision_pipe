@@ -51,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
     p.add_argument("--text-only", "-t", action="store_true",
                    help="Plain English output instead of JSON")
-    p.add_argument("--model", default="yolov8n",
-                   help="Model name or path (for future extension)")
+    p.add_argument("--model", default=None,
+                   help="Path to ONNX model file. If omitted, uses bundled default.")
     return p
 
 
@@ -65,7 +65,12 @@ def ext_type(path):
     return None
 
 
-def ensure_model() -> str:
+def ensure_model(override_path=None) -> str:
+    if override_path is not None:
+        if os.path.exists(override_path):
+            return os.path.abspath(override_path)
+        sys.stderr.write(f"model not found: {override_path}\n")
+        sys.exit(2)
     if os.path.exists(MODEL_PATH):
         return os.path.abspath(MODEL_PATH)
     try:
@@ -380,7 +385,7 @@ def main() -> int:
         )
         return 2
 
-    model_path = ensure_model()
+    model_path = ensure_model(args.model)
     session = load_session(model_path)
 
     if kind == 'image':
