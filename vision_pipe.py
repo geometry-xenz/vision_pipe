@@ -15,6 +15,21 @@ MODEL_PATH = os.path.join(
 
 _quiet = False
 
+COCO_NAMES = (
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+    'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
+    'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+    'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana',
+    'apple', 'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza',
+    'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed', 'dining table',
+    'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock',
+    'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -156,6 +171,97 @@ def extract_frames(path, fps):
             sys.exit(1)
 
 
+def preprocess(frame, target=640):
+    import cv2
+    import numpy as np
+
+    h, w = frame.shape[:2]
+    scale = target / max(h, w)
+    new_h = min(target, int(round(h * scale)))
+    new_w = min(target, int(round(w * scale)))
+    pad_h = target - new_h
+    pad_w = target - new_w
+
+    resized = cv2.resize(frame, (new_w, new_h))
+    padded = cv2.copyMakeBorder(
+        resized, 0, pad_h, 0, pad_w,
+        borderType=cv2.BORDER_CONSTANT, value=(114, 114, 114),
+    )
+    rgb = padded[..., ::-1]
+    tensor = (
+        rgb.transpose(2, 0, 1)[np.newaxis].astype(np.float32) / 255.0
+    )
+    tensor = np.ascontiguousarray(tensor)
+    return tensor, scale
+
+
+def infer(session, frame, conf=0.25, classes=None):
+    tensor, scale = preprocess(frame)
+    inv = 1.0 / scale
+    out = session.run(None, {session.get_inputs()[0].name: tensor})[0]
+    rows = out[0].T
+    keep_classes = None
+    if classes is not None:
+        keep_classes = {c.lower() for c in classes}
+
+    dets = []
+    for row in rows:
+        probs = row[4:]
+        max_conf = float(probs.max())
+        if max_conf < conf:
+            continue
+        class_id = int(probs.argmax())
+        name = COCO_NAMES[class_id]
+        if keep_classes is not None and name.lower() not in keep_classes:
+            continue
+        xc, yc, bw, bh = row[0], row[1], row[2], row[3]
+        x1 = float((xc - bw / 2) * inv)
+        y1 = float((yc - bh / 2) * inv)
+        x2 = float((xc + bw / 2) * inv)
+        y2 = float((yc + bh / 2) * inv)
+        dets.append({
+            'class': name,
+            'confidence': max_conf,
+            'bbox': [x1, y1, x2, y2],
+        })
+    return dets
+
+
+def nms(dets, iou_thresh=0.45):
+    if not dets:
+        return []
+    by_class = {}
+    for d in dets:
+        by_class.setdefault(d['class'], []).append(d)
+    out = []
+    for group in by_class.values():
+        group.sort(key=lambda d: d['confidence'], reverse=True)
+        kept = []
+        for d in group:
+            x1, y1, x2, y2 = d['bbox']
+            ok = True
+            for k in kept:
+                kx1, ky1, kx2, ky2 = k['bbox']
+                iw = max(0.0, min(x2, kx2) - max(x1, kx1))
+                ih = max(0.0, min(y2, ky2) - max(y1, ky1))
+                inter = iw * ih
+                a1 = (x2 - x1) * (y2 - y1)
+                a2 = (kx2 - kx1) * (ky2 - ky1)
+                union = a1 + a2 - inter
+                if union > 0 and inter / union >= iou_thresh:
+                    ok = False
+                    break
+            if ok:
+                kept.append(d)
+        out.extend(kept)
+    return out
+
+
+def load_session(model_path):
+    import onnxruntime as ort
+    return ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+
+
 def main() -> int:
     parser = build_parser()
     parser.add_argument("--version", action="version", version=VERSION)
@@ -187,6 +293,7 @@ def main() -> int:
         return 2
 
     model_path = ensure_model()
+    session = load_session(model_path)
 
     if kind == 'image':
         import cv2
@@ -196,21 +303,31 @@ def main() -> int:
             return 2
         h, w = img.shape[:2]
         sys.stderr.write(f"image: {w}x{h}\n")
-        sys.stderr.write("not yet implemented\n")
-        return 1
+        dets = nms(infer(session, img, args.conf, args.classes))
+        for d in dets:
+            x1, y1, x2, y2 = d['bbox']
+            sys.stderr.write(
+                f"class {d['class']} conf={d['confidence']:.2f} "
+                f"bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]\n"
+            )
+        sys.stderr.write(f"image: {len(dets)} detections\n")
+        return 0
 
     if kind == 'video':
         duration = detect_duration(path)
         sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
-        n = 0
-        for _ in extract_frames(path, args.fps):
-            n += 1
-            if not _quiet and n % 10 == 0:
-                sys.stderr.write(f"processed {n} frames\n")
+        n_frames = 0
+        total_dets = 0
+        for frame in extract_frames(path, args.fps):
+            n_frames += 1
+            dets = nms(infer(session, frame, args.conf, args.classes))
+            total_dets += len(dets)
+            if not _quiet and n_frames % 10 == 0:
+                sys.stderr.write(f"processed {n_frames} frames\n")
         if not _quiet:
-            sys.stderr.write(f"processed {n} frames\n")
-        sys.stderr.write("not yet implemented\n")
-        return 1
+            sys.stderr.write(f"processed {n_frames} frames\n")
+        sys.stderr.write(f"video: {total_dets} detections across {n_frames} frames\n")
+        return 0
 
     sys.stderr.write("not yet implemented\n")
     return 1
