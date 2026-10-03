@@ -126,10 +126,34 @@ def analyze_image(path):
     }
 
 
-def _tesseract_text(path):
+SCRIPT_TO_LANG = {
+    "Latin": "eng", "Cyrillic": "rus", "Greek": "ell",
+    "Arabic": "ara", "Hebrew": "heb", "Devanagari": "hin",
+    "Bengali": "ben", "Gurmukhi": "pan", "Gujarati": "guj",
+    "Kannada": "kan", "Malayalam": "mal", "Tamil": "tam",
+    "Telugu": "tel", "Oriya": "ori", "Thai": "tha",
+    "Han": "chi_sim", "Hiragana": "jpn", "Katakana": "jpn",
+    "Hangul": "kor",
+}
+
+
+def _detect_script_tesseract(path):
     import subprocess
     r = subprocess.run(
-        ["tesseract", path, "-", "-l", "eng"],
+        ["tesseract", path, "-", "--psm", "0"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return None
+    for ln in r.stdout.splitlines():
+        if ln.lower().startswith("script:"):
+            return SCRIPT_TO_LANG.get(ln.split(":", 1)[1].strip(), "eng")
+    return None
+
+
+def _tesseract_text(path, lang):
+    r = subprocess.run(
+        ["tesseract", path, "-", "-l", lang],
         capture_output=True, text=True, timeout=30,
     )
     if r.returncode != 0:
@@ -138,7 +162,7 @@ def _tesseract_text(path):
     return {
         "text": " ".join(words),
         "word_count": len(words),
-        "language": "eng",
+        "language": lang,
         "is_text_heavy": len(words) >= 50,
         "engine": "tesseract",
     }
@@ -195,7 +219,8 @@ def _rapidocr_text(path):
 def extract_text(path):
     import shutil
     if shutil.which("tesseract"):
-        return _tesseract_text(path)
+        lang = _detect_script_tesseract(path) or "eng"
+        return _tesseract_text(path, lang)
     return _rapidocr_text(path)
 
 
