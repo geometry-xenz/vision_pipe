@@ -7,3 +7,4 @@ sentencepiece
 einops
 Pillow
 timm
+faster-whisper

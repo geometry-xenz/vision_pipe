@@ -170,6 +170,23 @@ python vision_pipe.py photo.jpg --caption    # auto-relaunches into venv
 
 **First `--caption` run downloads ~500MB of model weights to `~/.cache/huggingface/`.** Subsequent runs are cached. Don't panic if it seems slow the first time.
 
+### Optional: audio transcription (faster-whisper)
+
+The `--audio` flag (videos only) extracts the audio track via ffmpeg, transcribes with faster-whisper (base model, ~75MB), and adds a transcript block to the output JSON. Use it to feed complete video context to text-based models.
+
+```bash
+.venv/bin/python -m pip install faster-whisper
+python vision_pipe.py video.mp4 --audio          # adds audio: {language, segments, text}
+```
+
+On `--audio` first run, vision_pipe auto-relaunches into the venv and downloads the whisper base model (~75MB) into `~/.cache/huggingface/`. Cached after.
+
+The output JSON's `audio` block contains:
+- `language` + `language_probability` (whisper's auto-detected language)
+- `segments` with start/end timestamps per spoken region
+- `text` (full concatenated transcript)
+- `engine: "faster-whisper-base"`
+
 ### Optional: auto-export the ONNX model
 
 If `models/yolov8n.onnx` is missing, vision_pipe will export it on first run. Install ultralytics once:
@@ -289,6 +306,7 @@ Notable frames (2+ objects):
 | `--no-ocr` | | flag | false | Skip OCR even in default mode |
 | `--no-pixel` | | flag | false | Skip pixel layer even in default mode |
 | `--lang` | | code | auto | OCR language (`eng`, `chi_sim`, `ara`, `rus`, `hin`, `jpn`, ...). Auto-detects script if omitted. |
+| `--audio` | | flag | false | Extract + transcribe audio track (videos only). Adds `audio` block to JSON. |
 | `--help` | `-h` | flag | — | Show help and exit |
 | `--version` | `-v` | flag | — | Show version and exit |
 
