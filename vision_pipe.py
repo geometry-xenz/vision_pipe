@@ -53,6 +53,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Plain English output instead of JSON")
     p.add_argument("--model", default=None,
                    help="Path to ONNX model file. If omitted, uses bundled default.")
+    p.add_argument("--caption", action="store_true",
+                   help="Use Florence-2 caption model instead of YOLO detection")
+    p.add_argument("--palette-only", action="store_true",
+                   help="Output only the color palette (L0 pixel layer)")
+    p.add_argument("--ocr-only", action="store_true",
+                   help="Output only the OCR text (L1 OCR layer)")
+    p.add_argument("--detections-only", action="store_true",
+                   help="Output only YOLO detections (L2; default behavior)")
+    p.add_argument("--no-ocr", action="store_true",
+                   help="Skip OCR layer even in default mode")
+    p.add_argument("--no-pixel", action="store_true",
+                   help="Skip pixel layer even in default mode")
     return p
 
 
@@ -63,6 +75,167 @@ def ext_type(path):
     if ext in EXT_VIDEOS:
         return 'video'
     return None
+
+
+def _palette_kmeans(small_bgr, k=5):
+    import cv2
+    import numpy as np
+    arr = small_bgr.reshape(-1, 3).astype(np.float32)
+    _, labels, centers = cv2.kmeans(
+        arr, k, None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0),
+        3, cv2.KMEANS_RANDOM_CENTERS,
+    )
+    counts = np.bincount(labels.flatten(), minlength=k)
+    total = int(counts.sum())
+    out = []
+    for i in range(k):
+        b, g, r = (int(v) for v in centers[i])
+        out.append({
+            "hex": f"#{r:02x}{g:02x}{b:02x}",
+            "pct": round(counts[i] / total, 3),
+        })
+    out.sort(key=lambda c: -c["pct"])
+    return out
+
+
+def analyze_image(path):
+    import cv2
+    import numpy as np
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (256, 256))
+    arr = small.astype(np.float32)
+    mean_bgr = arr.reshape(-1, 3).mean(axis=0)
+    std_bgr = arr.reshape(-1, 3).std(axis=0)
+    brightness = float(mean_bgr.mean() / 255.0)
+    is_gray = bool(std_bgr.max() < 10)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    edge_density = float(cv2.Sobel(gray, cv2.CV_32F, 1, 1).var() / 10000.0)
+    return {
+        "width": w,
+        "height": h,
+        "mean_rgb": [round(float(v), 1) for v in mean_bgr[::-1]],
+        "std_rgb": [round(float(v), 1) for v in std_bgr[::-1]],
+        "brightness": round(brightness, 3),
+        "is_grayscale": is_gray,
+        "edge_density": round(edge_density, 3),
+        "palette": _palette_kmeans(small),
+    }
+
+
+def extract_text(path):
+    import shutil
+    import subprocess
+    if not shutil.which("tesseract"):
+        return None
+    r = subprocess.run(
+        ["tesseract", path, "-", "-l", "eng"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return None
+    words = r.stdout.split()
+    text = " ".join(words)
+    return {
+        "text": text,
+        "word_count": len(words),
+        "language": "eng",
+        "is_text_heavy": len(words) >= 50,
+    }
+
+
+def synthesize_summary(pixel, ocr, detections):
+    parts = []
+    if pixel:
+        parts.append(f"{pixel['width']}x{pixel['height']}")
+        parts.append(f"bright {pixel['brightness']:.2f}")
+        if pixel["is_grayscale"]:
+            parts.append("grayscale")
+        elif pixel["palette"]:
+            parts.append(f"dominant {pixel['palette'][0]['hex']}")
+    if ocr:
+        n = ocr["word_count"]
+        parts.append("no text" if n == 0 else f"{n} words")
+    if detections:
+        counts = detections.get("counts", {})
+        if counts:
+            inv = ", ".join(f"{counts[c]} {c}" for c in sorted(counts))
+            parts.append(f"detected {inv}")
+    return ", ".join(parts) + "." if parts else ""
+
+
+CAPTION_MODEL_ID = "microsoft/Florence-2-base-ft"
+_caption_model = None
+_caption_processor = None
+
+
+def _venv_python():
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '.venv', 'bin', 'python'
+    )
+
+
+def _load_caption_model():
+    global _caption_model, _caption_processor
+    if _caption_model is None:
+        try:
+            import torch
+            from PIL import Image
+            from transformers import AutoProcessor, AutoModelForCausalLM
+        except ImportError as e:
+            venv_py = _venv_python()
+            if os.path.exists(venv_py) and sys.executable != venv_py:
+                sys.stderr.write(f'relaunching with {venv_py}\n')
+                os.execv(venv_py, [venv_py] + sys.argv)
+            sys.stderr.write(
+                '--caption requires: pip install transformers torch sentencepiece einops Pillow timm\n'
+                f'missing module: {e.name}\n'
+            )
+            sys.exit(1)
+        if not _quiet:
+            sys.stderr.write(f"loading {CAPTION_MODEL_ID}...\n")
+        _caption_processor = AutoProcessor.from_pretrained(
+            CAPTION_MODEL_ID, trust_remote_code=True
+        )
+        _caption_model = AutoModelForCausalLM.from_pretrained(
+            CAPTION_MODEL_ID, trust_remote_code=True
+        ).eval()
+    return _caption_model, _caption_processor
+
+
+def caption_image(path):
+    model, processor = _load_caption_model()
+    from PIL import Image
+    import torch
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    task = "<MORE_DETAILED_CAPTION>"
+    inputs = processor(text=task, images=img, return_tensors="pt")
+    with torch.no_grad():
+        ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=256,
+            num_beams=3,
+            do_sample=False,
+        )
+    raw = processor.batch_decode(ids, skip_special_tokens=False)[0]
+    parsed = processor.post_process_generation(
+        raw, task=task, image_size=(w, h)
+    )
+    return {
+        "tool": "vision_pipe",
+        "version": "1.0",
+        "input": path,
+        "type": "image",
+        "width": w,
+        "height": h,
+        "model": CAPTION_MODEL_ID,
+        "caption": parsed[task].strip(),
+    }
 
 
 def ensure_model(override_path=None) -> str:
@@ -206,9 +379,9 @@ def infer(session, frame, conf=0.25, classes=None):
     inv = 1.0 / scale
     out = session.run(None, {session.get_inputs()[0].name: tensor})[0]
     rows = out[0].T
-    keep_classes = None
+    keep = None
     if classes is not None:
-        keep_classes = {c.lower() for c in classes}
+        keep = {c.lower() for c in classes}
 
     dets = []
     for row in rows:
@@ -218,7 +391,7 @@ def infer(session, frame, conf=0.25, classes=None):
             continue
         class_id = int(probs.argmax())
         name = COCO_NAMES[class_id]
-        if keep_classes is not None and name.lower() not in keep_classes:
+        if keep is not None and name.lower() not in keep:
             continue
         xc, yc, bw, bh = row[0], row[1], row[2], row[3]
         x1 = float((xc - bw / 2) * inv)
@@ -301,11 +474,7 @@ def aggregate(timeline, fps):
     return classes_detected, summary
 
 
-def format_image(d):
-    return json.dumps(d, indent=2)
-
-
-def format_video(d):
+def format_json(d):
     return json.dumps(d, indent=2)
 
 
@@ -385,85 +554,193 @@ def main() -> int:
         )
         return 2
 
-    model_path = ensure_model(args.model)
-    session = load_session(model_path)
+    if args.caption:
+        if kind != 'image':
+            sys.stderr.write("--caption supports images only (Florence-2 is an image model)\n")
+            return 2
+        payload = caption_image(path)
+        print(payload["caption"] if args.text_only else format_json(payload))
+        return 0
+
+    only_modes = sum([args.palette_only, args.ocr_only, args.detections_only])
+    if only_modes > 1:
+        sys.stderr.write("pick only one of --palette-only, --ocr-only, --detections-only\n")
+        return 2
+
+    if args.palette_only:
+        payload = _run_palette_only(path)
+        print(format_json(payload))
+        return 0
+    if args.ocr_only:
+        payload = _run_ocr_only(path)
+        print(format_json(payload))
+        return 0
+    if args.detections_only:
+        model_path = ensure_model(args.model)
+        session = load_session(model_path)
+        if kind == 'image':
+            return run_image(path, session, args)
+        return run_video(path, session, args)
 
     if kind == 'image':
-        import cv2
-        img = cv2.imread(path)
-        if img is None:
-            sys.stderr.write(f"could not read image: {path}\n")
-            return 2
-        h, w = img.shape[:2]
-        sys.stderr.write(f"image: {w}x{h}\n")
-        dets = nms(infer(session, img, args.conf, args.classes))
-        norm = [_round_det(d) for d in dets]
-        for d in norm:
-            x1, y1, x2, y2 = d['bbox']
-            sys.stderr.write(
-                f"class {d['class']} conf={d['confidence']:.2f} "
-                f"bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]\n"
-            )
-        sys.stderr.write(f"image: {len(norm)} detections\n")
-        payload = {
-            'tool': 'vision_pipe',
-            'version': '1.0',
-            'input': path,
-            'type': 'image',
-            'width': w,
-            'height': h,
-            'model': 'yolov8n',
-            'objects': norm,
-        }
-        print(format_text(payload) if args.text_only else format_image(payload))
-        return 0
-
+        return run_image_full(path, args)
     if kind == 'video':
-        duration = detect_duration(path)
-        sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
-        timeline = []
-        width = height = 0
-        n_frames = 0
-        total_dets = 0
-        inv_fps = 1.0 / args.fps if args.fps else 0.0
-        for frame in extract_frames(path, args.fps):
-            if n_frames == 0:
-                height, width = frame.shape[:2]
-            dets = nms(infer(session, frame, args.conf, args.classes))
-            norm = [_round_det(d) for d in dets]
-            timeline.append({
-                'frame': n_frames,
-                'timestamp': n_frames * inv_fps,
-                'objects': norm,
-            })
-            n_frames += 1
-            total_dets += len(norm)
-            if not _quiet and n_frames % 10 == 0:
-                sys.stderr.write(f"processed {n_frames} frames\n")
-        if not _quiet:
-            sys.stderr.write(f"processed {n_frames} frames\n")
-        sys.stderr.write(f"video: {total_dets} detections across {n_frames} frames\n")
-        classes_detected, summary = aggregate(timeline, args.fps)
-        payload = {
-            'tool': 'vision_pipe',
-            'version': '1.0',
-            'input': path,
-            'type': 'video',
-            'fps': args.fps,
-            'duration_sec': duration,
-            'total_frames': n_frames,
-            'width': width,
-            'height': height,
-            'model': 'yolov8n',
-            'classes_detected': classes_detected,
-            'timeline': timeline,
-            'summary': summary,
-        }
-        print(format_text(payload) if args.text_only else format_video(payload))
-        return 0
-
+        model_path = ensure_model(args.model)
+        session = load_session(model_path)
+        return run_video(path, session, args)
     sys.stderr.write("not yet implemented\n")
     return 1
+
+
+def _run_palette_only(path):
+    pixel = analyze_image(path)
+    return {
+        "tool": "vision_pipe",
+        "version": "1.2",
+        "input": path,
+        "type": "image",
+        "pixel": pixel,
+    }
+
+
+def _run_ocr_only(path):
+    ocr = extract_text(path)
+    return {
+        "tool": "vision_pipe",
+        "version": "1.2",
+        "input": path,
+        "type": "image",
+        "ocr": ocr,
+    }
+
+
+def run_image_full(path, args) -> int:
+    pixel = None if args.no_pixel else analyze_image(path)
+    ocr = None if args.no_ocr else extract_text(path)
+    dets, w, h = _detect_image(path, args)
+    counts = _class_counts(dets)
+    payload = {
+        "tool": "vision_pipe",
+        "version": "1.2",
+        "input": path,
+        "type": "image",
+        "width": w,
+        "height": h,
+        "pixel": pixel,
+        "ocr": ocr,
+        "detections": {"model": "yolov8n", "objects": dets, "counts": counts},
+    }
+    payload["summary"] = synthesize_summary(pixel, ocr, payload["detections"])
+    if args.text_only:
+        print(payload["summary"])
+    else:
+        print(format_json(payload))
+    return 0
+
+
+def _detect_image(path, args):
+    import cv2
+    model_path = ensure_model(args.model)
+    session = load_session(model_path)
+    img = cv2.imread(path)
+    if img is None:
+        sys.stderr.write(f"could not read image: {path}\n")
+        sys.exit(2)
+    h, w = img.shape[:2]
+    sys.stderr.write(f"image: {w}x{h}\n")
+    dets = nms(infer(session, img, args.conf, args.classes))
+    norm = [_round_det(d) for d in dets]
+    for d in norm:
+        x1, y1, x2, y2 = d["bbox"]
+        sys.stderr.write(
+            f"class {d['class']} conf={d['confidence']:.2f} "
+            f"bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]\n"
+        )
+    sys.stderr.write(f"image: {len(norm)} detections\n")
+    return norm, w, h
+
+
+def _class_counts(dets):
+    counts = {}
+    for d in dets:
+        counts[d["class"]] = counts.get(d["class"], 0) + 1
+    return counts
+
+
+def run_image(path, session, args) -> int:
+    import cv2
+    img = cv2.imread(path)
+    if img is None:
+        sys.stderr.write(f"could not read image: {path}\n")
+        return 2
+    h, w = img.shape[:2]
+    sys.stderr.write(f"image: {w}x{h}\n")
+    dets = nms(infer(session, img, args.conf, args.classes))
+    norm = [_round_det(d) for d in dets]
+    for d in norm:
+        x1, y1, x2, y2 = d['bbox']
+        sys.stderr.write(
+            f"class {d['class']} conf={d['confidence']:.2f} "
+            f"bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]\n"
+        )
+    sys.stderr.write(f"image: {len(norm)} detections\n")
+    payload = {
+        'tool': 'vision_pipe',
+        'version': '1.0',
+        'input': path,
+        'type': 'image',
+        'width': w,
+        'height': h,
+        'model': 'yolov8n',
+        'objects': norm,
+    }
+    print(format_text(payload) if args.text_only else format_json(payload))
+    return 0
+
+
+def run_video(path, session, args) -> int:
+    duration = detect_duration(path)
+    sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
+    timeline = []
+    width = height = 0
+    n_frames = 0
+    total_dets = 0
+    inv_fps = 1.0 / args.fps if args.fps else 0.0
+    for frame in extract_frames(path, args.fps):
+        if n_frames == 0:
+            height, width = frame.shape[:2]
+        dets = nms(infer(session, frame, args.conf, args.classes))
+        norm = [_round_det(d) for d in dets]
+        timeline.append({
+            'frame': n_frames,
+            'timestamp': n_frames * inv_fps,
+            'objects': norm,
+        })
+        n_frames += 1
+        total_dets += len(norm)
+        if not _quiet and n_frames % 10 == 0:
+            sys.stderr.write(f"processed {n_frames} frames\n")
+    if not _quiet:
+        sys.stderr.write(f"processed {n_frames} frames\n")
+    sys.stderr.write(f"video: {total_dets} detections across {n_frames} frames\n")
+    classes_detected, summary = aggregate(timeline, args.fps)
+    payload = {
+        'tool': 'vision_pipe',
+        'version': '1.0',
+        'input': path,
+        'type': 'video',
+        'fps': args.fps,
+        'duration_sec': duration,
+        'total_frames': n_frames,
+        'width': width,
+        'height': height,
+        'model': 'yolov8n',
+        'classes_detected': classes_detected,
+        'timeline': timeline,
+        'summary': summary,
+    }
+    print(format_text(payload) if args.text_only else format_json(payload))
+    return 0
 
 
 if __name__ == "__main__":

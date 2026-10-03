@@ -1,2 +1,11 @@
 onnxruntime
 opencv-python
+
+# --caption (Florence-2) — install into a venv, e.g.:
+#   uv venv .venv && .venv/bin/python -m pip install -r requirements-caption.txt
+transformers==4.46.3
+torch==2.14.1
+sentencepiece
+einops
+Pillow
+timm

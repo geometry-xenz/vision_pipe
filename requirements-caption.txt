@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+--index-strategy unsafe-best-match
+
+transformers==4.46.3
+torch==2.14.1
+sentencepiece
+einops
+Pillow
+timm
