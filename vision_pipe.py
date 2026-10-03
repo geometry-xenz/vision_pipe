@@ -65,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip OCR layer even in default mode")
     p.add_argument("--no-pixel", action="store_true",
                    help="Skip pixel layer even in default mode")
+    p.add_argument("--audio", action="store_true",
+                   help="Extract + transcribe audio track (videos only)")
     p.add_argument("--lang", default=None,
                    help="OCR language code (e.g. eng, chi_sim, ara, rus, hin). "
                         "Auto-detected from script if omitted.")
@@ -832,7 +834,7 @@ def run_video(path, session, args) -> int:
     classes_detected, summary = aggregate(timeline, args.fps)
     payload = {
         'tool': 'vision_pipe',
-        'version': '1.0',
+        'version': '1.2',
         'input': path,
         'type': 'video',
         'fps': args.fps,
@@ -845,8 +847,70 @@ def run_video(path, session, args) -> int:
         'timeline': timeline,
         'summary': summary,
     }
+    if args.audio:
+        payload['audio'] = _transcribe_video(path)
     print(format_text(payload) if args.text_only else format_json(payload))
     return 0
+
+
+def _transcribe_video(path):
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        venv_py = _venv_python()
+        if os.path.exists(venv_py) and sys.executable != venv_py:
+            sys.stderr.write(f'relaunching with {venv_py}\n')
+            os.execv(venv_py, [venv_py] + sys.argv)
+        sys.stderr.write(
+            '--audio requires: pip install faster-whisper\n'
+            '(no system pkg, ~75MB model download on first run)\n'
+        )
+        return None
+    global _whisper_model
+    if _whisper_model is None:
+        if not _quiet:
+            sys.stderr.write('loading whisper base...\n')
+        _whisper_model = WhisperModel('base', device='cpu', compute_type='int8')
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+        wav = tmp.name
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-loglevel', 'error', '-y', '-i', path,
+             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', wav],
+            capture_output=True, timeout=120,
+        )
+        if r.returncode != 0:
+            sys.stderr.write(f'ffmpeg audio extract failed: {r.stderr.decode()[:200]}\n')
+            return None
+        segs, info = _whisper_model.transcribe(wav, beam_size=5)
+        seg_list = list(segs)
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+    return {
+        'language': info.language,
+        'language_probability': round(float(info.language_probability), 3),
+        'duration_sec': round(float(info.duration), 2),
+        'segment_count': len(seg_list),
+        'segments': [
+            {'start': round(s.start, 2), 'end': round(s.end, 2),
+             'text': s.text.strip()}
+            for s in seg_list
+        ],
+        'text': ' '.join(s.text.strip() for s in seg_list),
+        'engine': 'faster-whisper-base',
+    }
+
+
+_whisper_model = None
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":
