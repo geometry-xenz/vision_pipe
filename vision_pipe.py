@@ -173,6 +173,11 @@ _caption_processor = None
 
 
 def _venv_python():
+    if os.name == 'nt':
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '.venv', 'Scripts', 'python.exe',
+        )
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '.venv', 'bin', 'python'
     )
