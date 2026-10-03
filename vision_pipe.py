@@ -9,6 +9,7 @@ VERSION = "vision_pipe 1.0"
 
 EXT_IMAGES = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif'}
 EXT_VIDEOS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv'}
+EXT_AUDIO = {'.mp3', '.wav', '.m4a', '.flac', '.aac', '.ogg', '.opus', '.wma'}
 
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'models', 'yolov8n.onnx'
@@ -79,6 +80,8 @@ def ext_type(path):
         return 'image'
     if ext in EXT_VIDEOS:
         return 'video'
+    if ext in EXT_AUDIO:
+        return 'audio'
     return None
 
 
@@ -696,6 +699,8 @@ def main() -> int:
         model_path = ensure_model(args.model)
         session = load_session(model_path)
         return run_video(path, session, args)
+    if kind == 'audio':
+        return run_audio(path, args)
     sys.stderr.write("not yet implemented\n")
     return 1
 
@@ -848,12 +853,37 @@ def run_video(path, session, args) -> int:
         'summary': summary,
     }
     if args.audio:
-        payload['audio'] = _transcribe_video(path)
+        payload['audio'] = _transcribe(path)
     print(format_text(payload) if args.text_only else format_json(payload))
     return 0
 
 
-def _transcribe_video(path):
+def run_audio(path, args) -> int:
+    payload = {
+        'tool': 'vision_pipe',
+        'version': '1.2',
+        'input': path,
+        'type': 'audio',
+    }
+    audio = _transcribe(path)
+    if audio is None:
+        return 1
+    payload['audio'] = audio
+    if args.text_only:
+        print(audio['text'])
+    else:
+        print(format_json(payload))
+    return 0
+
+
+def _transcribe_video(path):  # kept for back-compat alias
+    return _transcribe(path)
+
+
+_whisper_model = None
+
+
+def _transcribe(path):
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -904,9 +934,6 @@ def _transcribe_video(path):
         'text': ' '.join(s.text.strip() for s in seg_list),
         'engine': 'faster-whisper-base',
     }
-
-
-_whisper_model = None
 
 
 if __name__ == "__main__":
