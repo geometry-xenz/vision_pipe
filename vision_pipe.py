@@ -65,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip OCR layer even in default mode")
     p.add_argument("--no-pixel", action="store_true",
                    help="Skip pixel layer even in default mode")
+    p.add_argument("--lang", default=None,
+                   help="OCR language code (e.g. eng, chi_sim, ara, rus, hin). "
+                        "Auto-detected from script if omitted.")
     return p
 
 
@@ -169,10 +172,20 @@ def _tesseract_text(path, lang):
 
 
 _rapidocr_engine = None
+_rapidocr_lang = None
+
+RAPIDOCR_LANG_MAP = {
+    "eng": "english",
+    "chi_sim": "chinese",
+    "chi_tra": "chinese",
+    "jpn": "japan",
+    "kor": "korean",
+    "te": "te",
+}
 
 
-def _rapidocr_text(path):
-    global _rapidocr_engine
+def _rapidocr_text(path, lang=None):
+    global _rapidocr_engine, _rapidocr_lang
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
@@ -181,10 +194,21 @@ def _rapidocr_text(path):
             sys.stderr.write(f'relaunching with {venv_py}\n')
             os.execv(venv_py, [venv_py] + sys.argv)
         return None
-    if _rapidocr_engine is None:
+    requested = lang or "eng"
+    rec = RAPIDOCR_LANG_MAP.get(requested)
+    if rec is None:
+        sys.stderr.write(
+            f'rapidocr does not support {requested}; '
+            f'supported: {", ".join(sorted(RAPIDOCR_LANG_MAP))}\n'
+            f'install tesseract for full 100+ language coverage\n'
+        )
+        requested = "eng"
+        rec = "english"
+    if _rapidocr_engine is None or _rapidocr_lang != rec:
         if not _quiet:
-            sys.stderr.write('loading rapidocr...\n')
-        _rapidocr_engine = RapidOCR()
+            sys.stderr.write(f'loading rapidocr ({rec})...\n')
+        _rapidocr_engine = RapidOCR(params={"lang_rec": rec})
+        _rapidocr_lang = rec
     try:
         result = _rapidocr_engine(path)
     except Exception as e:
@@ -209,19 +233,19 @@ def _rapidocr_text(path):
     return {
         "text": " ".join(words),
         "word_count": len(words),
-        "language": "eng",
+        "language": requested,
         "is_text_heavy": len(words) >= 50,
         "regions": regions,
         "engine": "rapidocr",
     }
 
 
-def extract_text(path):
+def extract_text(path, lang=None):
     import shutil
     if shutil.which("tesseract"):
-        lang = _detect_script_tesseract(path) or "eng"
-        return _tesseract_text(path, lang)
-    return _rapidocr_text(path)
+        ocr_lang = lang or _detect_script_tesseract(path) or "eng"
+        return _tesseract_text(path, ocr_lang)
+    return _rapidocr_text(path, lang)
 
 
 def synthesize_summary(pixel, ocr, detections):
@@ -654,7 +678,7 @@ def main() -> int:
         print(format_json(payload))
         return 0
     if args.ocr_only:
-        payload = _run_ocr_only(path)
+        payload = _run_ocr_only(path, args.lang)
         print(format_json(payload))
         return 0
     if args.detections_only:
@@ -685,8 +709,8 @@ def _run_palette_only(path):
     }
 
 
-def _run_ocr_only(path):
-    ocr = extract_text(path)
+def _run_ocr_only(path, lang=None):
+    ocr = extract_text(path, lang)
     return {
         "tool": "vision_pipe",
         "version": "1.2",
@@ -698,7 +722,7 @@ def _run_ocr_only(path):
 
 def run_image_full(path, args) -> int:
     pixel = None if args.no_pixel else analyze_image(path)
-    ocr = None if args.no_ocr else extract_text(path)
+    ocr = None if args.no_ocr else extract_text(path, args.lang)
     dets, w, h = _detect_image(path, args)
     counts = _class_counts(dets)
     payload = {
