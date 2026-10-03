@@ -126,11 +126,8 @@ def analyze_image(path):
     }
 
 
-def extract_text(path):
-    import shutil
+def _tesseract_text(path):
     import subprocess
-    if not shutil.which("tesseract"):
-        return None
     r = subprocess.run(
         ["tesseract", path, "-", "-l", "eng"],
         capture_output=True, text=True, timeout=30,
@@ -138,13 +135,68 @@ def extract_text(path):
     if r.returncode != 0:
         return None
     words = r.stdout.split()
-    text = " ".join(words)
     return {
-        "text": text,
+        "text": " ".join(words),
         "word_count": len(words),
         "language": "eng",
         "is_text_heavy": len(words) >= 50,
+        "engine": "tesseract",
     }
+
+
+_rapidocr_engine = None
+
+
+def _rapidocr_text(path):
+    global _rapidocr_engine
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        venv_py = _venv_python()
+        if os.path.exists(venv_py) and sys.executable != venv_py:
+            sys.stderr.write(f'relaunching with {venv_py}\n')
+            os.execv(venv_py, [venv_py] + sys.argv)
+        return None
+    if _rapidocr_engine is None:
+        if not _quiet:
+            sys.stderr.write('loading rapidocr...\n')
+        _rapidocr_engine = RapidOCR()
+    try:
+        result = _rapidocr_engine(path)
+    except Exception as e:
+        sys.stderr.write(f'ocr failed: {e}\n')
+        return None
+    if not result or not result[0]:
+        return {"text": "", "word_count": 0, "language": "eng",
+                "is_text_heavy": False, "engine": "rapidocr"}
+    regions = []
+    words = []
+    for bbox, text, conf in result[0]:
+        if not text:
+            continue
+        x1, y1 = bbox[0]
+        x3, y3 = bbox[2]
+        regions.append({
+            "text": text,
+            "bbox": [int(x1), int(y1), int(x3), int(y3)],
+            "conf": round(float(conf), 3),
+        })
+        words.extend(text.split())
+    return {
+        "text": " ".join(words),
+        "word_count": len(words),
+        "language": "eng",
+        "is_text_heavy": len(words) >= 50,
+        "regions": regions,
+        "engine": "rapidocr",
+    }
+
+
+def extract_text(path):
+    import shutil
+    if shutil.which("tesseract"):
+        return _tesseract_text(path)
+    return _rapidocr_text(path)
 
 
 def synthesize_summary(pixel, ocr, detections):
