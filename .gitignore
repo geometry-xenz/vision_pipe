@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# large binaries and logs that should not be in the repo
+hexstrike.log
+models/florence2/onnx/*.onnx
+models/yolov8n.onnx
+.venv/

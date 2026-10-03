@@ -188,6 +188,55 @@ The output JSON's `audio` block contains:
 - `text` (full concatenated transcript)
 - `engine: "faster-whisper-base"`
 
+### Built-in: scene detection + audio features + narrative (videos)
+
+Every video run includes three new layers by default. Zero extra deps — pure numpy + opencv.
+
+**Audio semantic features** (`audio.features` in JSON). Pure-signal analysis: RMS energy, zero-crossing rate, spectral centroid, spectral flatness. Heuristic tags: `silent` / `quiet` / `moderate` / `loud`, `speech_present`, `music_likely`, `tonal`, `noisy`, `bright`, `dynamic`. Mood: `silent` / `intimate` / `energetic` / `intense` / `neutral`. No ML models, no API, no new package weight.
+
+**Scene change detection** (`scenes` in JSON). Inline during the YOLO pass — compares HSV histograms between consecutive frames via Bhattacharyya distance, marks cuts above threshold. Output: list of `{scene_id, start_frame, end_frame, start_ts, end_ts, frame_count}`. Tune sensitivity with `--scene-threshold` (0.1=very sensitive, 0.9=only hard cuts).
+
+**Cross-modal narrative** (`narrative` in JSON). The fusion block. For each detected scene, joins:
+- top visual objects (from YOLO detections in that frame range)
+- spoken transcript segments that fall in the scene's time range
+- audio mood tag
+
+Each scene gets a one-line `summary` like: `visual: person×4, dining table×3 | audio: "So I made a mistake..." | mood: intimate | (1.5s)`. This is the closest equivalent to a vision-language model's per-segment understanding — produced deterministically, no LLM call.
+
+```bash
+python vision_pipe.py video.mp4 --fps 2 --audio --scene-threshold 0.3 --text-only
+```
+
+```text
+Video analysis (140 frames at 2.0 fps, 70.1s total):
+
+Detections by class:
+  - person: 161 total
+  - bowl: 79 total
+  - dining table: 52 total
+  ...
+
+Scenes detected: 10
+  scene 0: 0.0s → 1.5s (4 frames)
+  scene 4: 3.0s → 14.0s (23 frames)
+  ...
+
+Audio semantic features:
+  loudness (rms): 0.1092
+  spectral centroid: 1810.7 Hz
+  speech ratio: 0.302
+  mood: intimate
+  tags: moderate, speech_present, music_likely
+
+Cross-modal narrative (10 scenes):
+  scene 0 [0.0s-1.5s]: visual: person×4, dining table×3, chair×2, baseball bat×2 | audio: "So I made a mistake. When my son came out as gay, I told him, I accepted." | mood: intimate | (1.5s)
+  scene 4 [3.0s-14.0s]: visual: person×26, dining table×7, bowl×5, chair×4, bottle | audio: "So I made a mistake. When my son came out as gay, I told him, I accepted. I hope all parents are watching this. I have a news to share. I'm making a cake for the first time..." | mood: intimate | (11.0s)
+  scene 5 [14.0s-40.5s]: visual: person×64, bowl×53, cake×21, dining table×11, wine glass×5 | audio: "I always heated the concept of gay and when Anish came out as gay few years ago. Truthfully, I had sleepless nights..." | mood: intimate | (26.5s)
+  ...
+```
+
+Disable any layer with `--no-audio-features`, `--no-scenes`, or `--no-narrative`.
+
 ### Optional: auto-export the ONNX model
 
 If `models/yolov8n.onnx` is missing, vision_pipe will export it on first run. Install ultralytics once:
@@ -308,6 +357,10 @@ Notable frames (2+ objects):
 | `--no-pixel` | | flag | false | Skip pixel layer even in default mode |
 | `--lang` | | code | auto | OCR language (`eng`, `chi_sim`, `ara`, `rus`, `hin`, `jpn`, ...). Auto-detects script if omitted. |
 | `--audio` | | flag | false | Extract + transcribe audio track (videos only). Adds `audio` block to JSON. |
+| `--no-audio-features` | | flag | false | Skip audio semantic features (loudness, music/speech tags, mood) |
+| `--no-scenes` | | flag | false | Skip scene change detection |
+| `--no-narrative` | | flag | false | Skip cross-modal narrative synthesis (fusion block) |
+| `--scene-threshold` | | float | 0.5 | Scene cut sensitivity (0.1=very sensitive, 0.9=only hard cuts) |
 | `--help` | `-h` | flag | — | Show help and exit |
 | `--version` | `-v` | flag | — | Show version and exit |
 
@@ -487,7 +540,7 @@ With vision_pipe on a 180-frame video:
 ```json
 {
   "tool": "vision_pipe",
-  "version": "1.0",
+  "version": "1.3",
   "input": "video.mp4",
   "type": "video",
   "fps": 1.0,
@@ -507,12 +560,54 @@ With vision_pipe on a 180-frame video:
     }
   ],
   "summary": {
-    "person": {
-      "count": 45,
-      "first_seen": 0.0,
-      "last_seen": 179.0
+    "person": {"count": 45, "first_seen": 0.0, "last_seen": 179.0}
+  },
+  "scenes": [
+    {
+      "scene_id": 0,
+      "start_frame": 0,
+      "end_frame": 30,
+      "start_ts": 0.0,
+      "end_ts": 30.0,
+      "frame_count": 31
     }
-  }
+  ],
+  "audio": {
+    "transcript": {
+      "language": "en",
+      "language_probability": 0.98,
+      "duration_sec": 178.2,
+      "segment_count": 12,
+      "segments": [{"start": 0.5, "end": 4.2, "text": "..."}],
+      "text": "...",
+      "engine": "faster-whisper-base"
+    },
+    "features": {
+      "duration_sec": 178.2,
+      "sample_rate": 16000,
+      "loudness_rms_mean": 0.11,
+      "spectral_centroid_mean_hz": 1810.7,
+      "spectral_flatness_mean": 0.31,
+      "speech_ratio": 0.30,
+      "tags": ["moderate", "speech_present", "music_likely"],
+      "mood": "intimate",
+      "engine": "numpy-stdlib-v1"
+    }
+  },
+  "narrative": [
+    {
+      "scene_id": 0,
+      "start_ts": 0.0,
+      "end_ts": 30.0,
+      "duration_sec": 30.0,
+      "frame_count": 31,
+      "objects": "person×12, car×3",
+      "top_objects": [{"class": "person", "count": 12}],
+      "spoken": "So I made a mistake...",
+      "mood": "intimate",
+      "summary": "visual: person×12, car×3 | audio: \"So I made a mistake...\" | mood: intimate | (30.0s)"
+    }
+  ]
 }
 ```
 
