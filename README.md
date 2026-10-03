@@ -138,39 +138,47 @@ On a modern 8-core CPU, processing 1 minute of video at 1 fps takes approximatel
 
 ## Installation
 
-### Requirements
-
-**Python packages (runtime):**
-```
-pip install onnxruntime opencv-python
-```
-
-**System dependency:**
-```
-ffmpeg must be in PATH
-```
-
-On macOS: `brew install ffmpeg`
-On Ubuntu/Debian: `sudo apt install ffmpeg`
-On Windows: Download from ffmpeg.org and add to PATH
-
-**First-run model export (optional):**
-If `models/yolov8n.onnx` is not present, vision_pipe will auto-export it from the ultralytics weights on first run. For this, install:
-```
-pip install ultralytics onnx
-```
-
 ### Quick Start
 
 ```bash
-# Install dependencies
+git clone <repo-url> vision_pipe
+cd vision_pipe
 pip install onnxruntime opencv-python
-
-# Run directly
 python vision_pipe.py photo.jpg
 ```
 
-On first run, the YOLOv8n ONNX model will be auto-downloaded and exported. Subsequent runs use the cached model.
+That's it. Detection + pixel + OCR (English via rapidocr fallback) work without anything else.
+
+### System dependencies
+
+| tool | needed for | install |
+|---|---|---|
+| `ffmpeg` | video frame extraction | macOS: `brew install ffmpeg`. Debian/Ubuntu: `sudo apt install ffmpeg`. Arch: `sudo pacman -S ffmpeg`. Windows: `choco install ffmpeg` |
+| `tesseract` | OCR for non-English images + auto-detect | macOS: `brew install tesseract tesseract-lang`. Debian/Ubuntu: `sudo apt install tesseract-ocr tesseract-ocr-eng`. Arch: `sudo pacman -S tesseract tesseract-data-eng`. Windows: `choco install tesseract` |
+
+vision_pipe auto-detects both. Missing `ffmpeg` → only image mode. Missing `tesseract` → OCR falls back to rapidocr (English only); install tesseract + lang packs for global.
+
+### Optional: caption model (Florence-2)
+
+The `--caption` flag uses Florence-2-base-ft. It needs a venv with ML deps:
+
+```bash
+uv venv .venv
+.venv/bin/python -m pip install -r requirements-caption.txt
+python vision_pipe.py photo.jpg --caption    # auto-relaunches into venv
+```
+
+**First `--caption` run downloads ~500MB of model weights to `~/.cache/huggingface/`.** Subsequent runs are cached. Don't panic if it seems slow the first time.
+
+### Optional: auto-export the ONNX model
+
+If `models/yolov8n.onnx` is missing, vision_pipe will export it on first run. Install ultralytics once:
+
+```bash
+pip install ultralytics onnx
+```
+
+Pre-bundled model ships in the repo, so this is rarely needed.
 
 ---
 
@@ -273,9 +281,90 @@ Notable frames (2+ objects):
 | `--classes` | | str[] | all | Space-separated class names to filter |
 | `--quiet` | `-q` | flag | false | Suppress progress output |
 | `--text-only` | `-t` | flag | false | Plain English output instead of JSON |
-| `--model` | | str | yolov8n | Model name or path (for future extension) |
+| `--model` | | path | bundled | Path to an ONNX model file (overrides default) |
+| `--caption` | | flag | false | Use Florence-2-base-ft caption model instead of YOLO |
+| `--palette-only` | | flag | false | Output only L0 pixel layer (brightness + palette) |
+| `--ocr-only` | | flag | false | Output only L1 OCR layer (text + regions) |
+| `--detections-only` | | flag | false | Output only L2 YOLO detections (default behavior) |
+| `--no-ocr` | | flag | false | Skip OCR even in default mode |
+| `--no-pixel` | | flag | false | Skip pixel layer even in default mode |
+| `--lang` | | code | auto | OCR language (`eng`, `chi_sim`, `ara`, `rus`, `hin`, `jpn`, ...). Auto-detects script if omitted. |
 | `--help` | `-h` | flag | — | Show help and exit |
 | `--version` | `-v` | flag | — | Show version and exit |
+
+### Default Output (Detection + Pixel + OCR + Summary)
+
+```bash
+python vision_pipe.py photo.jpg
+```
+
+Returns a single JSON with all four layers. No model call unless `--caption` is set.
+
+```json
+{
+  "tool": "vision_pipe",
+  "version": "1.2",
+  "input": "photo.jpg",
+  "type": "image",
+  "width": 1920,
+  "height": 1080,
+  "pixel": {
+    "mean_rgb": [117.3, 115.5, 118.3],
+    "std_rgb": [74.6, 65.7, 58.7],
+    "brightness": 0.46,
+    "is_grayscale": false,
+    "edge_density": 0.22,
+    "palette": [
+      {"hex": "#1f222f", "pct": 0.28},
+      {"hex": "#aea193", "pct": 0.26},
+      {"hex": "#195a9a", "pct": 0.05}
+    ]
+  },
+  "ocr": {
+    "text": "Welcome to New York",
+    "word_count": 4,
+    "language": "eng",
+    "is_text_heavy": false,
+    "regions": [{"text": "Welcome to New York", "bbox": [10, 20, 380, 60], "conf": 0.94}],
+    "engine": "rapidocr"
+  },
+  "detections": {
+    "model": "yolov8n",
+    "objects": [...],
+    "counts": {"person": 4, "car": 2}
+  },
+  "summary": "1920x1080, bright 0.46, dominant #1f222f, 4 words, detected 1 bus, 4 person."
+}
+```
+
+Skip a layer with `--no-ocr` or `--no-pixel`. Just want one layer? Use `--palette-only`, `--ocr-only`, or `--detections-only`.
+
+### Global OCR (Multi-Language)
+
+With tesseract installed, vision_pipe auto-detects the script and OCRs in the right language. No `--lang` flag needed:
+
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-{eng,chi_sim,deu,fra,ara,rus,hin,jpn,kor,tha,tam,ben}   # Debian example
+python vision_pipe.py chinese_sign.jpg    # → detected Han → chi_sim
+python vision_pipe.py arabic_doc.jpg     # → detected Arabic → ara
+python vision_pipe.py russian_road.jpg   # → detected Cyrillic → rus
+```
+
+Force a specific language with `--lang`:
+
+```bash
+python vision_pipe.py image.jpg --lang chi_sim
+```
+
+Multiple languages at once (tesseract only):
+
+```bash
+python vision_pipe.py image.jpg --lang chi_sim+eng   # mixed-script image
+```
+
+Supported tesseract codes are whatever your installed `tesseract-data-*` packs cover. ~100 languages available.
+
+Without tesseract, rapidocr fallback supports 6 languages: `eng`, `chi_sim`, `chi_tra`, `jpn`, `kor`, `te`. Other codes warn and fall back to English.
 
 ---
 
@@ -548,6 +637,17 @@ python vision_pipe.py video.mp4
 
 Or manually download and place the ONNX file at `models/yolov8n.onnx`.
 
+### OCR returns null
+
+OCR is only invoked when tesseract or rapidocr is available. To enable:
+
+- **Tesseract** (recommended, 100+ langs with auto-detect): install via your OS package manager, see [Installation](#system-dependencies).
+- **RapidOCR** (auto-installs in the `.venv` if missing): just run `--caption` once to bootstrap the venv, then `--ocr-only` will use rapidocr English model.
+
+### Caption runs but takes forever the first time
+
+Florence-2-base-ft is a 500MB download on first `--caption` run. Cached at `~/.cache/huggingface/hub/` after that. Slow first time is normal.
+
 ### Slow performance on large videos
 
 - Lower the `--fps` to extract fewer frames (e.g., `--fps 0.5` for one frame every 2 seconds)
@@ -565,9 +665,10 @@ vision_pipe processes frames one at a time and cleans up temp files after. If yo
 - `--stream` flag: emit JSON Lines as each frame completes (for very long videos)
 - `--gpu` flag: enable CUDA acceleration when available
 - `--batch` flag: process a directory of images/videos
-- Custom ONNX models: pass any YOLO-compatible ONNX file
-- Multiple model options: YOLOv8s, YOLOv5s for higher accuracy
-- FFmpeg bundling: static FFmpeg binary for true portability
+- PaddleOCR opt-in for pip-only global coverage (no tesseract needed)
+- GOT-OCR / multilingual end-to-end transformer
+- Video temporal reasoning (track objects across frames, scene change detection)
+- CLI installer (`vision_pipe install`) that auto-detects OS + installs tesseract + lang packs
 
 ---
 
