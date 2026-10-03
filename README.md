@@ -172,11 +172,12 @@ python vision_pipe.py photo.jpg --caption    # auto-relaunches into venv
 
 ### Optional: audio transcription (faster-whisper)
 
-The `--audio` flag (videos only) extracts the audio track via ffmpeg, transcribes with faster-whisper (base model, ~75MB), and adds a transcript block to the output JSON. Use it to feed complete video context to text-based models.
+The `--audio` flag extracts the audio track from videos. Standalone audio files (`.mp3`, `.wav`, `.m4a`, ...) are also accepted as input and transcribed automatically. Both use faster-whisper (base model, ~75MB) and add a transcript block to the output JSON. Use it to feed complete video or audio context to text-based models.
 
 ```bash
 .venv/bin/python -m pip install faster-whisper
-python vision_pipe.py video.mp4 --audio          # adds audio: {language, segments, text}
+python vision_pipe.py video.mp4 --audio          # video: add audio block
+python vision_pipe.py speech.wav                 # audio file: transcribe directly
 ```
 
 On `--audio` first run, vision_pipe auto-relaunches into the venv and downloads the whisper base model (~75MB) into `~/.cache/huggingface/`. Cached after.
@@ -525,7 +526,24 @@ With vision_pipe on a 180-frame video:
 ### Videos
 `.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`, `.flv`, `.wmv`
 
-FFmpeg handles most codecs natively. If a specific codec is missing on the target system, that's an environment issue — vision_pipe doesn't need modification.
+### Audio
+`.mp3`, `.wav`, `.m4a`, `.flac`, `.aac`, `.ogg`, `.opus`, `.wma`
+
+Standalone audio files are accepted as input. They're transcribed with faster-whisper (requires the venv). For video inputs, pass `--audio` to also transcribe the audio track.
+
+FFmpeg handles all format detection natively. If a codec is missing on the target system, that's an environment issue — vision_pipe doesn't need modification.
+
+## Multimodal JSON Output
+
+vision_pipe produces a single JSON per input that combines all detected layers into one structured context — ready to feed to any text-based model:
+
+```bash
+python vision_pipe.py video.mp4 --fps 1 --audio > context.json
+ollama run llama3.1 "What happens in this video? Use the structured data below.
+$(jq -r '\n• transcript: ' + .audio.text + '\n• classes: ' + (.classes_detected | join(', '))' context.json)"
+```
+
+vision_pipe is a multimodal-shaped **extractor** (image + audio + detection + palette + OCR + transcript), not a multimodal **reasoner**. It gives you 95% of the context a multimodal model would give you for 0% of the cost. Chain it to a local LLM (`ollama`, `llama.cpp`, etc.) to get narrative understanding back.
 
 ---
 
