@@ -71,8 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", default=None,
                    help="OCR language code (e.g. eng, chi_sim, ara, rus, hin). "
                         "Auto-detected from script if omitted.")
-    p.add_argument("--no-audio-features", action="store_true",
-                   help="Skip audio semantic feature extraction (loudness, music, mood)")
+    p.add_argument("--audio-features", action="store_true",
+                   help="Analyze audio for loudness, music, mood (pure numpy, opt-in due to compute cost)")
     p.add_argument("--no-scenes", action="store_true",
                    help="Skip scene change detection")
     p.add_argument("--no-narrative", action="store_true",
@@ -941,7 +941,7 @@ def run_video(path, session, args) -> int:
             sys.stderr.write("transcribing audio...\n")
         audio_block = _transcribe(path)
     audio_features = None
-    if not args.no_audio_features:
+    if args.audio_features:
         if not _quiet:
             sys.stderr.write("analyzing audio features...\n")
         audio_features = analyze_audio_features(path)
@@ -965,16 +965,20 @@ def run_video(path, session, args) -> int:
 def run_audio(path, args) -> int:
     payload = {
         'tool': 'vision_pipe',
-        'version': '1.2',
+        'version': '1.3',
         'input': path,
         'type': 'audio',
     }
-    audio = _transcribe(path)
-    if audio is None:
+    transcript = _transcribe(path)
+    if transcript is None:
         return 1
-    payload['audio'] = audio
+    payload['audio'] = {'transcript': transcript}
+    if args.audio_features:
+        features = analyze_audio_features(path)
+        if features:
+            payload['audio']['features'] = features
     if args.text_only:
-        print(audio['text'])
+        print(transcript['text'])
     else:
         print(format_json(payload))
     return 0
@@ -1074,10 +1078,11 @@ def _read_wav_mono(path):
     with wave.open(path, 'rb') as w:
         sr = w.getframerate()
         n = w.getnframes()
+        sw = w.getsampwidth()
         raw = w.readframes(n)
-    if w.getsampwidth() == 2:
+    if sw == 2:
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif w.getsampwidth() == 4:
+    elif sw == 4:
         samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
     else:
         samples = np.frombuffer(raw, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
@@ -1227,67 +1232,6 @@ def analyze_audio_features(path):
             pass
 
 
-def detect_scene_changes_from_frames(frames_iter, fps, threshold=0.5):
-    """Detect scene cuts by comparing HSV histograms between consecutive frames.
-
-    Args:
-        frames_iter: iterator yielding BGR frames (np.ndarray)
-        fps: frames per second being extracted
-        threshold: Bhattacharyya distance threshold (0..1, lower = more sensitive)
-
-    Returns:
-        list of {"scene_id", "start_frame", "end_frame", "start_ts", "end_ts"}
-    """
-    import cv2
-    import numpy as np
-
-    scenes = []
-    cur_start = 0
-    prev_hist = None
-    idx = 0
-
-    for frame in frames_iter:
-        # downscale for speed
-        small = cv2.resize(frame, (160, 90))
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        hist = hist.flatten().astype(np.float32)
-        hist /= (hist.sum() + 1e-12)
-
-        if prev_hist is not None:
-            dist = cv2.compareHist(
-                prev_hist.astype(np.float32),
-                hist,
-                cv2.HISTCMP_BHATTACHARYYA,
-            )
-            if dist > threshold:
-                # scene cut — close previous
-                scenes.append({
-                    "scene_id": len(scenes),
-                    "start_frame": cur_start,
-                    "end_frame": idx - 1,
-                    "start_ts": round(cur_start / fps, 3) if fps else 0.0,
-                    "end_ts": round((idx - 1) / fps, 3) if fps else 0.0,
-                    "frame_count": idx - cur_start,
-                })
-                cur_start = idx
-        prev_hist = hist
-        idx += 1
-
-    # close the final scene
-    if idx > cur_start:
-        scenes.append({
-            "scene_id": len(scenes),
-            "start_frame": cur_start,
-            "end_frame": idx - 1,
-            "start_ts": round(cur_start / fps, 3) if fps else 0.0,
-            "end_ts": round((idx - 1) / fps, 3) if fps else 0.0,
-            "frame_count": idx - cur_start,
-        })
-
-    return scenes
-
-
 def synthesize_narrative(timeline, scenes, audio):
     """Cross-modal fusion: combine visual objects + scene boundaries + audio into
     a per-scene narrative readable by any text LLM.
@@ -1303,14 +1247,11 @@ def synthesize_narrative(timeline, scenes, audio):
     by_frame = {e['frame']: e for e in timeline}
     transcript_segs = []
     if audio and isinstance(audio, dict):
-        # audio block may have either flat "segments" or nested "transcript.segments"
-        segs = audio.get('segments') or []
-        if not segs:
-            tr = audio.get('transcript') or {}
-            if isinstance(tr, dict):
-                segs = tr.get('segments') or []
-        transcript_segs = [(s.get('start', 0.0), s.get('end', 0.0), s.get('text', ''))
-                          for s in segs if s.get('text')]
+        tr = audio.get('transcript') or {}
+        if isinstance(tr, dict):
+            segs = tr.get('segments') or []
+            transcript_segs = [(s.get('start', 0.0), s.get('end', 0.0), s.get('text', ''))
+                              for s in segs if s.get('text')]
 
     out = []
     for s in scenes:
@@ -1371,10 +1312,6 @@ def _scene_summary_line(objects, spoken, mood, duration):
     if duration > 0:
         parts.append(f"({duration:.1f}s)")
     return " | ".join(parts) if parts else "(no content)"
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 
 
 if __name__ == "__main__":
