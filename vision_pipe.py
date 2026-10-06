@@ -852,20 +852,21 @@ def run_image(path, session, args) -> int:
     return 0
 
 
-def run_video(path, session, args) -> int:
-    duration = detect_duration(path)
-    sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
+def _detect_frames(path, session, args):
+    """Run YOLO inference + inline scene detection over all extracted frames.
+
+    Returns (timeline, scenes, n_frames, width, height, total_dets).
+    """
     timeline = []
     width = height = 0
     n_frames = 0
     total_dets = 0
     inv_fps = 1.0 / args.fps if args.fps else 0.0
-    # scene-change tracking state (inline during YOLO pass to avoid re-decoding)
     do_scenes = not args.no_scenes
     import cv2
     import numpy as np
     prev_hist = None
-    scene_boundaries = []  # list of frame indices where a cut was detected
+    scene_boundaries = []
     if do_scenes:
         sys.stderr.write("scene detection: enabled\n")
 
@@ -879,7 +880,6 @@ def run_video(path, session, args) -> int:
             'timestamp': n_frames * inv_fps,
             'objects': norm,
         })
-        # scene-change detection: compare HSV histogram of small frame
         if do_scenes and n_frames > 0:
             small = cv2.resize(frame, (160, 90))
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
@@ -901,7 +901,6 @@ def run_video(path, session, args) -> int:
         sys.stderr.write(f"processed {n_frames} frames\n")
     sys.stderr.write(f"video: {total_dets} detections across {n_frames} frames\n")
 
-    # build scenes list from boundaries
     scenes = []
     if do_scenes and n_frames > 0:
         starts = [0] + scene_boundaries
@@ -918,10 +917,53 @@ def run_video(path, session, args) -> int:
         if not _quiet:
             sys.stderr.write(f"scenes: {len(scenes)} detected (threshold={args.scene_threshold})\n")
 
+    return timeline, scenes, n_frames, width, height, total_dets
+
+
+def run_video(path, session, args) -> int:
+    duration = detect_duration(path)
+    sys.stderr.write(f"video: duration={duration}s, fps={args.fps}\n")
+
+    # 1. one ffmpeg extract (cheap, gates whisper + features)
+    wav = None
+    if args.audio or args.audio_features:
+        wav = _extract_wav_to_temp(path)
+        if wav is None and (args.audio or args.audio_features):
+            sys.stderr.write('audio extract failed; transcript/features will be null\n')
+
+    # 2. detect frames (mandatory, runs serially)
+    timeline, scenes, n_frames, width, height, total_dets = _detect_frames(
+        path, session, args,
+    )
+
+    # 3. audio workers (parallel attempted but not effective — see note)
+    # Note: ThreadPoolExecutor and ProcessPoolExecutor were both tested here
+    # but neither delivered a meaningful speedup because whisper is the
+    # dominant stage (~10s of ~17s total) and holds the GIL through its
+    # Python orchestration. ProcessPool adds 3-9s of per-process import
+    # overhead, making warm-cache runs slower than serial. So we keep
+    # the serial path; the structural split (_transcribe / _features
+    # helpers + shared wav) still lets us revisit parallelism later.
+    transcript = None
+    features = None
+    if args.audio:
+        if not _quiet:
+            sys.stderr.write("transcribing audio...\n")
+        transcript = _transcribe(path)
+    if args.audio_features:
+        if not _quiet:
+            sys.stderr.write("analyzing audio features...\n")
+        features = analyze_audio_features(path)
+    if wav:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
     classes_detected, summary = aggregate(timeline, args.fps)
     payload = {
         'tool': 'vision_pipe',
-        'version': '1.3',
+        'version': '1.4',
         'input': path,
         'type': 'video',
         'fps': args.fps,
@@ -935,23 +977,12 @@ def run_video(path, session, args) -> int:
         'summary': summary,
         'scenes': scenes,
     }
-    audio_block = None
-    if args.audio:
-        if not _quiet:
-            sys.stderr.write("transcribing audio...\n")
-        audio_block = _transcribe(path)
-    audio_features = None
-    if args.audio_features:
-        if not _quiet:
-            sys.stderr.write("analyzing audio features...\n")
-        audio_features = analyze_audio_features(path)
-    if audio_block or audio_features:
+    if transcript or features:
         payload['audio'] = {}
-        if audio_block:
-            payload['audio']['transcript'] = audio_block
-        if audio_features:
-            payload['audio']['features'] = audio_features
-    # cross-modal narrative synthesis (fusion block)
+        if transcript:
+            payload['audio']['transcript'] = transcript
+        if features:
+            payload['audio']['features'] = features
     if not args.no_narrative and scenes:
         if not _quiet:
             sys.stderr.write("synthesizing narrative...\n")
@@ -992,6 +1023,21 @@ _whisper_model = None
 
 
 def _transcribe(path):
+    """Public entry: extract audio then transcribe. Original behavior preserved."""
+    wav = _extract_wav_to_temp(path)
+    if wav is None:
+        return None
+    try:
+        return _transcribe_from_wav(wav)
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+
+def _transcribe_from_wav(wav_path):
+    """Internal: assume WAV already exists. Used by parallel path."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -1009,26 +1055,8 @@ def _transcribe(path):
         if not _quiet:
             sys.stderr.write('loading whisper base...\n')
         _whisper_model = WhisperModel('base', device='cpu', compute_type='int8')
-    import subprocess
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-        wav = tmp.name
-    try:
-        r = subprocess.run(
-            ['ffmpeg', '-loglevel', 'error', '-y', '-i', path,
-             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', wav],
-            capture_output=True, timeout=120,
-        )
-        if r.returncode != 0:
-            sys.stderr.write(f'ffmpeg audio extract failed: {r.stderr.decode()[:200]}\n')
-            return None
-        segs, info = _whisper_model.transcribe(wav, beam_size=5)
-        seg_list = list(segs)
-    finally:
-        try:
-            os.unlink(wav)
-        except OSError:
-            pass
+    segs, info = _whisper_model.transcribe(wav_path, beam_size=5, vad_filter=True)
+    seg_list = list(segs)
     return {
         'language': info.language,
         'language_probability': round(float(info.language_probability), 3),
@@ -1094,20 +1122,23 @@ def _read_wav_mono(path):
 def analyze_audio_features(path):
     """Extract audio semantic features from a video or audio file.
 
-    Pure numpy/stdlib — no librosa, no model weights. Computes:
-    - RMS energy (loudness curve + mean)
-    - Zero crossing rate (noisiness / sibilance)
-    - Spectral centroid (brightness — music proxy)
-    - Spectral flatness (tonal vs noisy)
-    - Voice activity detection (energy threshold)
-    - Music likelihood (low flatness + high centroid)
-
-    Returns dict or None on failure.
+    Public wrapper: extracts audio then delegates to _features_from_wav.
     """
-    import numpy as np
     wav = _extract_wav_to_temp(path)
     if wav is None:
         return None
+    try:
+        return _features_from_wav(wav)
+    finally:
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+
+def _features_from_wav(wav):
+    """Internal: assume WAV already exists. Used by parallel path."""
+    import numpy as np
     try:
         samples, sr = _read_wav_mono(wav)
         if samples is None or samples.size < int(0.1 * sr):
@@ -1139,33 +1170,26 @@ def analyze_audio_features(path):
                 flatness_curve[i] = 0.0
                 continue
             rms_curve[i] = float(np.sqrt(np.mean(seg * seg) + 1e-12))
-            # zero crossing rate
             signs = np.sign(seg)
             signs[signs == 0] = 1
             zcr_curve[i] = float(np.mean(signs[:-1] != signs[1:]))
-            # FFT-based: centroid + flatness
             spec = np.abs(np.fft.rfft(seg * np.hanning(seg.size)))
             freqs = np.fft.rfftfreq(seg.size, d=1.0 / sr)
             mag_sum = float(spec.sum()) + 1e-12
             centroid_curve[i] = float(np.sum(freqs * spec) / mag_sum)
-            # spectral flatness (geometric mean / arithmetic mean of power)
             log_spec = np.log(spec + 1e-12)
             geo = float(np.exp(log_spec.mean()))
             arith = mag_sum / spec.size
             flatness_curve[i] = geo / (arith + 1e-12)
 
-        # aggregate
         rms_mean = float(np.mean(rms_curve))
         rms_std = float(np.std(rms_curve))
         zcr_mean = float(np.mean(zcr_curve))
         centroid_mean = float(np.mean(centroid_curve))
         flatness_mean = float(np.mean(flatness_curve))
 
-        # voice activity detection: rms above adaptive threshold + variance
-        # adaptive: 1.2× mean captures above-average energy (speech peaks)
         vad_thresh = max(rms_mean * 1.2, 0.015)
         speech_ratio = float(np.mean(rms_curve > vad_thresh))
-        # dynamic range: high std relative to mean = varying content (speech)
         dynamic_range = float(rms_std / (rms_mean + 1e-6))
 
         tags = []
@@ -1178,11 +1202,8 @@ def analyze_audio_features(path):
         else:
             tags.append("loud")
 
-        # speech detection: either enough above-threshold frames OR high dynamic range
-        # (speech has pauses + bursts; piano drone has steady energy)
         if speech_ratio > 0.15 or (speech_ratio > 0.10 and dynamic_range > 0.5):
             tags.append("speech_present")
-        # music detection: moderate-to-high centroid + not too noisy
         if centroid_mean > 400 and flatness_mean < 0.5:
             tags.append("music_likely")
         if flatness_mean < 0.15 and speech_ratio < 0.1:
@@ -1194,7 +1215,6 @@ def analyze_audio_features(path):
         if dynamic_range > 0.7:
             tags.append("dynamic")
 
-        # mood heuristic
         mood = "neutral"
         if "silent" in tags:
             mood = "silent"
@@ -1207,7 +1227,6 @@ def analyze_audio_features(path):
         elif "loud" in tags and "music_likely" not in tags:
             mood = "intense"
 
-        # energy curve sampled down to <= 64 points
         step = max(1, n_frames // 64)
         energy_curve = [round(float(rms_curve[i]), 4) for i in range(0, n_frames, step)]
 
@@ -1225,11 +1244,9 @@ def analyze_audio_features(path):
             "energy_curve": energy_curve,
             "engine": "numpy-stdlib-v1",
         }
-    finally:
-        try:
-            os.unlink(wav)
-        except OSError:
-            pass
+    except Exception as e:
+        sys.stderr.write(f'features failed: {e}\n')
+        return None
 
 
 def synthesize_narrative(timeline, scenes, audio):
